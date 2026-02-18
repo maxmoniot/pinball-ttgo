@@ -182,10 +182,6 @@ bool myBallAtEnemy = false;
 float myBallEnemyPosX = 0;  // Position X de ma balle chez l'ennemi (0-135)
 uint8_t myBallAtPeerID = 0; // ID du peer qui a ma balle
 uint32_t lastBallPosReceived = 0;  // Dernier update de position reçu
-uint32_t myBallSentTime = 0;  // Quand ma balle a été envoyée chez l'ennemi
-
-// Timeout: si pas de nouvelles de la balle depuis X ms, considérer qu'elle est perdue
-#define BALL_AT_ENEMY_TIMEOUT 2000  // 2 secondes
 
 // Pour traquer le propriétaire de la balle ennemie qu'on a
 uint8_t enemyBallOwnerID = 0;  // ID du joueur à qui appartient la balle ennemie chez nous
@@ -288,7 +284,6 @@ uint32_t lastPingSent = 0;
 // Prototypes
 void initGame();
 void initBall(Ball &ball, bool isMine, bool resetScore = true);
-void checkBallAtEnemyTimeout();  // Vérifie si la balle chez l'ennemi a timeout
 bool canLaunchBall();
 int countMyActiveBalls();
 void triggerMultiball();
@@ -474,63 +469,59 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       break;
       
     case 1: // BALL_SEND
-      // Si c'est MA balle qui revient, toujours l'accepter
-      if (msg.originalOwnerID == myID) {
-        // C'est MA balle qui revient!
-        myBall.active = true;
-        myBall.isMine = true;
-        myBall.ownerID = myID;
-        myBall.color = myColor;
-        myBall.x = SCREEN_W - msg.ballX;
-        myBall.y = GAME_TOP + BALL_RADIUS + 5;
-        myBall.vx = -msg.ballVx;
-        myBall.vy = fabs(msg.ballVy) * 0.8f + 1.0f;
-        myBall.trailIdx = 0;
-        for (int i = 0; i < 6; i++) {
-          myBall.trail[i][0] = myBall.x;
-          myBall.trail[i][1] = myBall.y;
-        }
-        myBallAtEnemy = false;
-        Serial.println(">>> My ball returned! <<<");
-        break;
-      }
-      
-      // C'est une balle ennemie - vérifier si on peut recevoir
+      // Vérifier si on peut recevoir (partie commencée et pas game over)
       if (!gameStarted || gameOver) {
-        Serial.println("Can't receive enemy ball - not ready");
+        // Renvoyer la balle immédiatement à un autre joueur
+        // ou la détruire si personne ne peut la recevoir
+        Serial.println("Can't receive ball - not ready");
         break;
       }
       
       {
-        // Balle ennemie
-        enemyBall.active = true;
-        enemyBall.isMine = false;
-        enemyBall.ownerID = msg.originalOwnerID;
-        enemyBall.color = msg.ownerColor;
-        enemyBallOwnerID = msg.originalOwnerID;
-        enemyBall.x = SCREEN_W - msg.ballX;
-        enemyBall.y = GAME_TOP + BALL_RADIUS + 5;
-        enemyBall.vx = -msg.ballVx;
-        enemyBall.vy = fabs(msg.ballVy) * 0.8f + 1.0f;
-        enemyBall.trailIdx = 0;
-        for (int i = 0; i < 6; i++) {
-          enemyBall.trail[i][0] = enemyBall.x;
-          enemyBall.trail[i][1] = enemyBall.y;
+        Ball *targetBall;
+        bool ballIsMine;
+        
+        if (msg.originalOwnerID == myID) {
+          // C'est MA balle qui revient!
+          targetBall = &myBall;
+          ballIsMine = true;
+          myBallAtEnemy = false;
+          Serial.println("My ball returned!");
+        } else {
+          // Balle ennemie
+          targetBall = &enemyBall;
+          ballIsMine = false;
+          enemyBallOwnerID = msg.originalOwnerID;  // Stocker le propriétaire
+          Serial.print("Ball from player ");
+          Serial.print(msg.senderID);
+          Serial.print(" (owner: ");
+          Serial.print(msg.originalOwnerID);
+          Serial.println(")");
         }
-        Serial.print("Enemy ball from player ");
-        Serial.print(msg.senderID);
-        Serial.print(" (owner: ");
-        Serial.print(msg.originalOwnerID);
-        Serial.println(")");
+        
+        targetBall->active = true;
+        targetBall->isMine = ballIsMine;
+        targetBall->ownerID = msg.originalOwnerID;
+        // Si c'est ma balle, utiliser ma couleur actuelle, sinon la couleur du message
+        targetBall->color = ballIsMine ? myColor : msg.ownerColor;
+        targetBall->x = SCREEN_W - msg.ballX;
+        targetBall->y = GAME_TOP + BALL_RADIUS + 5;
+        targetBall->vx = -msg.ballVx;
+        targetBall->vy = fabs(msg.ballVy) * 0.8f + 1.0f;
+        targetBall->trailIdx = 0;
+        for (int i = 0; i < 6; i++) {
+          targetBall->trail[i][0] = targetBall->x;
+          targetBall->trail[i][1] = targetBall->y;
+        }
       }
       break;
       
-    case 2: // BALL_LOST - une balle est tombée chez l'ennemi
+    case 2: // BALL_LOST - une balle est tombée chez quelqu'un
       if (msg.originalOwnerID == myID) {
-        // Ma balle est tombée chez un ennemi - PAS de perte de vie
-        // Je peux simplement relancer une nouvelle balle
+        // Ma balle est tombée chez un ennemi - je peux la relancer
         myBallAtEnemy = false;
-        Serial.println("My ball fell at enemy - can relaunch (no life lost)");
+        Serial.println("My ball fell at enemy - can relaunch");
+        // Note: on ne relance pas automatiquement, le joueur doit appuyer sur les boutons
       }
       break;
       
@@ -762,9 +753,15 @@ void sendBallToOwner(Ball &ball) {
   msg.lives = ballsLeft;
   msg.wasOwnedByMe = 0;
   
-  // Broadcast - le propriétaire va recevoir sa balle
-  uint8_t broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-  esp_now_send(broadcast, (uint8_t*)&msg, sizeof(GameMessage));
+  // Envoi direct au propriétaire (unicast) pour éviter de démultiplier la balle
+  int peerIdx = findPeerByID(ball.ownerID);
+  if (peerIdx >= 0) {
+    esp_now_send(peers[peerIdx].mac, (uint8_t*)&msg, sizeof(GameMessage));
+  } else {
+    // Fallback broadcast si le propriétaire n'est pas trouvé
+    uint8_t broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    esp_now_send(broadcast, (uint8_t*)&msg, sizeof(GameMessage));
+  }
   
   Serial.print("Ball returned to owner ");
   Serial.println(ball.ownerID);
@@ -894,7 +891,6 @@ void initGame() {
   myBallEnemyPosX = 0;
   myBallAtPeerID = 0;
   lastBallPosReceived = 0;
-  myBallSentTime = 0;
   currentBallScore = 0;
   multiballActive = false;
   
@@ -934,34 +930,9 @@ void initBall(Ball &ball, bool isMine, bool resetScore) {
   }
 }
 
-// Vérifie si la balle chez l'ennemi a timeout (pas de nouvelles depuis trop longtemps)
-void checkBallAtEnemyTimeout() {
-  if (!myBallAtEnemy) return;
-  
-  uint32_t now = millis();
-  uint32_t lastUpdate = max(lastBallPosReceived, myBallSentTime);
-  
-  if (now - lastUpdate > BALL_AT_ENEMY_TIMEOUT) {
-    Serial.println("!!! Ball at enemy TIMEOUT - assuming lost !!!");
-    Serial.print("    Last update: ");
-    Serial.print(now - lastUpdate);
-    Serial.println(" ms ago");
-    myBallAtEnemy = false;
-    // La balle était chez l'ennemi, donc PAS de perte de vie
-    // Le joueur peut simplement relancer
-    Serial.println("Can relaunch (no life lost)");
-  }
-}
-
 bool canLaunchBall() {
   if (myBall.active) return false;
-  
-  // Vérifier le timeout de la balle chez l'ennemi
-  if (myBallAtEnemy) {
-    checkBallAtEnemyTimeout();
-    if (myBallAtEnemy) return false;  // Toujours chez l'ennemi après vérification
-  }
-  
+  if (myBallAtEnemy) return false;
   // Vérifier si des multiballs sont encore actives
   for (int i = 0; i < 2; i++) {
     if (multiBalls[i].active) return false;
@@ -1086,8 +1057,6 @@ void checkBallTransfer(Ball &ball) {
         if (&ball == &myBall) {
           myBallAtEnemy = true;
           myBallEnemyPosX = ball.x;
-          myBallSentTime = millis();  // Noter le moment de l'envoi pour le timeout
-          Serial.println(">>> My ball sent to enemy <<<");
         }
         sendBallToRandomPeer(ball);
       }
@@ -1106,27 +1075,22 @@ void checkBallTransfer(Ball &ball) {
       // Compter les balles restantes APRÈS cette chute
       int remainingBalls = countMyActiveBalls();
       
-      Serial.print("Ball fell! Remaining balls: ");
-      Serial.println(remainingBalls);
-      
-      // On perd une vie SEULEMENT si plus aucune balle en jeu
-      if (remainingBalls == 0) {
+      if (isMultiball) {
+        Serial.println("Multiball lost");
+      } else {
+        // C'est myBall qui tombe CHEZ MOI - je perds une vie
         ballsLeft--;
-        Serial.print("No more balls in play - lost a life! Lives: ");
-        Serial.println(ballsLeft);
         if (ballsLeft <= 0) {
           gameOver = true;
-          Serial.println("GAME OVER!");
         }
       }
       
-      // Reset multiball si terminé (1 balle ou moins)
+      // Si on passe à 1 balle ou moins → reset le compteur pour recommencer
       if (remainingBalls <= 1) {
         currentBallScore = 0;
-        if (multiballActive) {
-          multiballActive = false;
-          Serial.println("Multiball ended");
-        }
+        multiballActive = false;
+        Serial.print("Back to single ball mode - score reset. Remaining: ");
+        Serial.println(remainingBalls);
       }
       
     } else {
@@ -1507,31 +1471,10 @@ void loop() {
     // Vérifier si on doit déclencher un multiball
     if (!gameOver) {
       checkMultiballTrigger();
-      
-      // Vérification anti-blocage: si le joueur n'a aucune balle en jeu et peut relancer
-      // mais que le bandeau ne s'affiche pas, forcer le déblocage
-      if (gameStarted && !myBall.active && ballsLeft > 0) {
-        bool anyMultiballActive = false;
-        for (int i = 0; i < 2; i++) {
-          if (multiBalls[i].active) anyMultiballActive = true;
-        }
-        
-        if (!anyMultiballActive) {
-          // Vérifier le timeout de la balle chez l'ennemi
-          checkBallAtEnemyTimeout();
-        }
-      }
     }
     
-    // Flippers: ne bougent plus en game over (sauf si balle ennemie encore en jeu)
-    if (!gameOver) {
-      leftFlipper.targetAngle = leftPressed ? leftFlipper.angleUp : leftFlipper.angleDown;
-      rightFlipper.targetAngle = rightPressed ? rightFlipper.angleUp : rightFlipper.angleDown;
-    } else {
-      // Game over: flippers en position basse
-      leftFlipper.targetAngle = leftFlipper.angleDown;
-      rightFlipper.targetAngle = rightFlipper.angleDown;
-    }
+    leftFlipper.targetAngle = leftPressed ? leftFlipper.angleUp : leftFlipper.angleDown;
+    rightFlipper.targetAngle = rightPressed ? rightFlipper.angleUp : rightFlipper.angleDown;
     updateFlippers();
     
     if (!gameOver) {
@@ -1572,20 +1515,19 @@ void loop() {
         }
         if (!anyActive) multiballActive = false;
       }
-    }
-    
-    // Balle ennemie: continue même en game over (jusqu'à ce qu'elle tombe ou sorte)
-    if (enemyBall.active) {
-      for (int step = 0; step < PHYSICS_SUBSTEPS; step++) {
-        updatePhysics(enemyBall);
-        checkCollisions(enemyBall);
-      }
-      checkBallTransfer(enemyBall);
       
-      if (frameCount % 2 == 0) {
-        enemyBall.trail[enemyBall.trailIdx][0] = enemyBall.x;
-        enemyBall.trail[enemyBall.trailIdx][1] = enemyBall.y;
-        enemyBall.trailIdx = (enemyBall.trailIdx + 1) % 6;
+      if (enemyBall.active) {
+        for (int step = 0; step < PHYSICS_SUBSTEPS; step++) {
+          updatePhysics(enemyBall);
+          checkCollisions(enemyBall);
+        }
+        checkBallTransfer(enemyBall);
+        
+        if (frameCount % 2 == 0) {
+          enemyBall.trail[enemyBall.trailIdx][0] = enemyBall.x;
+          enemyBall.trail[enemyBall.trailIdx][1] = enemyBall.y;
+          enemyBall.trailIdx = (enemyBall.trailIdx + 1) % 6;
+        }
       }
     }
     
@@ -1842,7 +1784,7 @@ void drawScoreBar() {
   }
   
   // Balles restantes au milieu-droite (décalé pour éviter le score)
-  int ballsStartX = (SCREEN_W / 2) + 25 - ((ballsLeft * 11) / 2);
+  int ballsStartX = (SCREEN_W / 2) + 10 - ((ballsLeft * 11) / 2);
   for (int i = 0; i < ballsLeft; i++) {
     int bx = ballsStartX + i * 11;
     buffer.fillCircle(bx, 12, 4, myColor);
